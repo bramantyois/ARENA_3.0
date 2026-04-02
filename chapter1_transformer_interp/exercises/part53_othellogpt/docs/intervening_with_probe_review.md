@@ -131,17 +131,84 @@ This corresponds exactly to the pattern needed for `C0` to be a legal move — p
 
 ## How much variance does the probe explain?
 
-To test how much of a neuron's behaviour is captured by the probe, we compute what fraction of the (unit-norm) weight vector lies in the **span of the probe directions**.
+To test how much of a neuron's behaviour is captured by the probe, we measure what fraction of the (unit-norm) weight vector lies in the **span of all probe directions** — a quantity closely analogous to $R^2$ in regression.
 
-We use SVD to find the probe subspace basis $U$ (shape `(d_model, rank)`):
+### Step 1 — Build the combined probe matrix
 
-$$\text{fraction explained} = \left\| \hat{W} \cdot U \right\|^2$$
+We have two probe tensors, each of shape `(d_model=512, 8, 8)`. Flatten the board dimensions:
 
-Since $\hat{W}$ is unit norm, this equals the squared norm of the projection — the fraction of variance explained.
+$$
+M_{\text{my}} \in \mathbb{R}^{512 \times 64}, \quad M_{\text{blank}} \in \mathbb{R}^{512 \times 64}
+$$
 
-For L5N1393:
-- **Input weights**: high fraction in probe basis → neuron fires in response to board state features
-- **Output weights**: lower fraction → neuron is writing toward move predictions, not updating the board state representation
+Then concatenate into a single matrix $P$:
+
+$$
+P = \begin{bmatrix} M_{\text{my}} \mid M_{\text{blank}} \end{bmatrix} \in \mathbb{R}^{512 \times 128}
+$$
+
+Each of the 128 columns is a probe direction for one cell under one concept (mine/theirs or blank). These columns are **not orthogonal** — nearby cells share redundant information.
+
+### Step 2 — SVD to extract an orthonormal basis
+
+Apply SVD to $P$:
+
+$$
+P = U \Sigma V^\top
+$$
+
+- $U \in \mathbb{R}^{512 \times 512}$ — orthonormal, columns span all of $\mathbb{R}^{512}$
+- $\Sigma$ — diagonal, singular values $\sigma_1 \geq \sigma_2 \geq \dots \geq 0$
+- $V^\top$ — how original probe columns combine into each principal direction (not used here)
+
+The **first $r$ columns of $U$** (where $r = \text{rank}(P) \leq 128$) form an orthonormal basis for the **column space of $P$** — the probe subspace. The remaining columns of $U$ span its orthogonal complement (directions no probe touches at all).
+
+In code:
+```python
+U, S, Vh = t.svd(t.cat([my_probe.reshape(cfg.d_model, 64), blank_probe.reshape(cfg.d_model, 64)], dim=1))
+probe_space_basis = U[:, :-4]   # drop last 4 columns (see below)
+```
+
+### Step 3 — Why drop the last 4 columns?
+
+The 4 center squares are **never blank** (they're always occupied at the start of the game), so their `blank_probe` vectors are effectively zero. SVD still produces $U$ columns for them (since $U$ must be square), but those columns correspond to near-zero singular values and are unconstrained by the data — they're numerical noise. Dropping them gives a clean basis for the meaningful probe subspace of dimension $\approx 124$.
+
+### Step 4 — Measure variance explained
+
+For a unit-norm weight vector $\hat{\mathbf{w}} \in \mathbb{R}^{512}$ (either $\hat{W}^{\text{in}}_{[:, n]}$ or $\hat{W}^{\text{out}}_{[n, :]}$), its orthogonal projection onto the probe subspace is:
+
+$$
+\hat{\mathbf{w}}_{\text{proj}} = U_{\text{probe}} \, U_{\text{probe}}^\top \, \hat{\mathbf{w}}
+$$
+
+The **fraction of variance explained** is the squared norm of this projection:
+
+$$
+\text{score} = \|\hat{\mathbf{w}}_{\text{proj}}\|^2 = \|U_{\text{probe}}^\top \, \hat{\mathbf{w}}\|^2 = \sum_{i} (\hat{\mathbf{w}} \cdot U_i)^2
+$$
+
+In code: `(w @ probe_space_basis).pow(2).sum()`
+
+Since $\hat{\mathbf{w}}$ is unit norm, $\sum_{\text{all }i}(\hat{\mathbf{w}} \cdot U_i)^2 = 1$, so the score is bounded in $[0, 1]$ and directly interpretable as an $R^2$.
+
+### Step 5 — The random baseline
+
+The probe subspace has dimension $\approx 124$ out of $512$. By symmetry, a **uniformly random** unit vector in $\mathbb{R}^{512}$ has expected score:
+
+$$
+\mathbb{E}[\text{score}] = \frac{124}{512} \approx 0.24
+$$
+
+So any score significantly above 0.24 is meaningful — the neuron's weights are systematically aligned with board-state directions.
+
+### Results for L5N1393
+
+| Weight vector | Score | Interpretation |
+|---|---|---|
+| Input $\hat{W}^{\text{in}}_{[:, n]}$ | **high** (> 0.24) | Neuron fires in response to board-state features — blank/mine/theirs for specific cells |
+| Output $\hat{W}^{\text{out}}_{[n, :]}$ | **lower** (~0.24) | Neuron writes toward move predictions (unembedding space), not back into the board-state representation |
+
+This asymmetry is exactly what you'd expect for a "C0 is legal" detector: it *reads* from the board state (high input alignment) but *writes* to the output logits (low output alignment with the probe subspace).
 
 ---
 
